@@ -2682,14 +2682,14 @@ class Drudge:
                 exts_inters = None
             else:
 
-                def seq_op(curr, new):
-                    """Merge current externals with a new Einstein result."""
-                    curr[0].update(new[1])
-                    curr[1] = _inters(curr[1], new[1])
-                    return curr
-
-                result = einst_res.fold(seq_op, [set(), None]).compute()
-                exts_union, exts_inters = result
+                # Process all einst results and manually aggregate
+                all_results = einst_res.compute()
+                exts_union = set()
+                exts_inters = None
+                
+                for terms_list, external_vars in all_results:
+                    exts_union.update(external_vars)
+                    exts_inters = _inters(exts_inters, external_vars)
 
         else:
             res_terms = []

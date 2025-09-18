@@ -1394,9 +1394,9 @@ class Tensor:
 
         rewritten = self._terms.map(
             lambda term: rewrite_term(term, vecs, new_amp)
-        ).cache()
+        ).persist()
         new_terms = [
-            i for i in rewritten.countByKey().keys() if i is not None
+            i for i in rewritten.pluck(0).distinct().compute() if i is not None
         ]
 
         get_term = operator.itemgetter(1)
@@ -2672,7 +2672,7 @@ class Drudge:
 
             einst_res = summand.expand().terms.map(
                 lambda x: einst_term(x, resolvers.value)
-            ).cache()
+            ).persist()
             tensor = Tensor(
                 self, einst_res.map(operator.itemgetter(0)).flatten(), expanded=True
             )

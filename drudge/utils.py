@@ -250,6 +250,11 @@ class EnumSymbs(AtomicExpr, metaclass=_EnumSymbsMeta):
 #
 
 
+class _SimpleBcastValue:
+    """Simple wrapper to provide .value attribute for compatibility."""
+    def __init__(self, value):
+        self.value = value
+
 class BCastVar:
     """Automatically broadcast variables.
 
@@ -284,8 +289,8 @@ class BCastVar:
     @property
     def bcast(self):
         """Get the broadcast variable."""
-        # In Dask, we just return the variable itself
-        return self._var
+        # Return a wrapper that has .value for compatibility with Spark broadcast variables
+        return _SimpleBcastValue(self._var)
 
     @property
     def value(self):

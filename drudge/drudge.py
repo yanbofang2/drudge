@@ -218,11 +218,16 @@ class Tensor:
         """Get the free variables in the given terms."""
 
         # The terms are definitely going to be used for other purposes.
-        terms.cache()
+        terms = terms.persist()
 
-        return terms.map(
+        free_vars_list = terms.map(
             lambda term: term.free_vars
-        ).aggregate(set(), _union, _union)
+        ).compute()
+        
+        result = set()
+        for vars_set in free_vars_list:
+            result.update(vars_set)
+        return result
         # TODO: investigate performance characteristic with treeAggregate.
 
     @property
@@ -645,9 +650,16 @@ class Tensor:
         else:
             specials = _DecomposeSpecials(consts, gens)
 
-        return terms.map(
+        decomposed = terms.map(
             functools.partial(_decompose_term, specials=specials)
-        ).reduceByKey(operator.add).map(_recover_term)
+        )
+        # Group by key and sum coefficients
+        grouped = decomposed.groupby(lambda pair: pair[0])
+        merged = grouped.map(lambda group: (
+            group[0],  # key
+            sum(pair[1] for pair in group[1])  # sum coefficients
+        ))
+        return merged.map(_recover_term)
 
     #
     # Canonicalization
@@ -909,9 +921,9 @@ class Tensor:
         if isinstance(other, Tensor):
 
             if right:
-                prod = other.terms.cartesian(self._terms)
+                prod = other.terms.product(self._terms)
             else:
-                prod = self._terms.cartesian(other.terms)
+                prod = self._terms.product(other.terms)
 
             free_vars = self.free_vars | other.free_vars
             expanded = self._expanded and other._expanded
@@ -2676,15 +2688,8 @@ class Drudge:
                     curr[1] = _inters(curr[1], new[1])
                     return curr
 
-                def comb_op(curr, new):
-                    """Merge externals from different partitions."""
-                    curr[0].update(new[0])
-                    curr[1] = _inters(curr[1], new[1])
-                    return curr
-
-                exts_union, exts_inters = einst_res.aggregate(
-                    [set(), None], seq_op, comb_op
-                )
+                result = einst_res.fold(seq_op, [set(), None]).compute()
+                exts_union, exts_inters = result
 
         else:
             res_terms = []

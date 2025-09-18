@@ -7,7 +7,7 @@ import itertools
 import operator
 import typing
 
-from pyspark import RDD
+from dask.bag import Bag
 from sympy import sympify, Expr, Integer, KroneckerDelta, SympifyError
 
 from .drudge import Drudge
@@ -79,8 +79,8 @@ class GenQuadDrudge(Drudge, abc.ABC):
         """
         pass
 
-    def normal_order(self, terms: RDD, **kwargs):
-        """Normal order the terms in the RDD."""
+    def normal_order(self, terms: Bag, **kwargs):
+        """Normal order the terms in the Bag."""
 
         if len(kwargs) > 0:
             raise ValueError('Invalid keyword arguments', kwargs)

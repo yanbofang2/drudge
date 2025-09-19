@@ -126,6 +126,7 @@ class WickDrudge(Drudge, abc.ABC):
 
         if self._wick_parallel == 0:
 
+            # Try to replicate flatMap more closely
             normal_ordered = wick_terms.map(lambda x: [
                 _form_term_from_wick(x[0], x[1], phase, resolvers.value, i)
                 for i in x[2]

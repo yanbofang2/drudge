@@ -8,7 +8,8 @@ import abc
 import functools
 import typing
 
-from pyspark import RDD
+import dask.bag as db
+from dask.bag import Bag
 from sympy import Expr
 
 from .drudge import Drudge
@@ -92,7 +93,7 @@ class WickDrudge(Drudge, abc.ABC):
         """
         pass
 
-    def normal_order(self, terms: RDD, **kwargs):
+    def normal_order(self, terms: Bag, **kwargs):
         """Normal order the terms according to generalized Wick theorem.
 
         The actual expansion is based on the information given in the subclasses
@@ -110,12 +111,12 @@ class WickDrudge(Drudge, abc.ABC):
         symms = self.symms
         resolvers = self.resolvers
 
-        terms.cache()
+        terms = terms.persist()
         terms_to_proc = terms.filter(lambda x: len(x.vecs) > 1)
         keep_top = 0 if comparator is None else 1
         terms_to_keep = terms.filter(lambda x: len(x.vecs) <= keep_top)
-        terms_to_proc.cache()
-        if terms_to_proc.count() == 0:
+        terms_to_proc = terms_to_proc.persist()
+        if terms_to_proc.count().compute() == 0:
             return terms_to_keep
 
         # Triples: term, contractions, schemes.
@@ -125,16 +126,17 @@ class WickDrudge(Drudge, abc.ABC):
 
         if self._wick_parallel == 0:
 
-            normal_ordered = wick_terms.flatMap(lambda x: [
+            # Try to replicate flatMap more closely
+            normal_ordered = wick_terms.map(lambda x: [
                 _form_term_from_wick(x[0], x[1], phase, resolvers.value, i)
                 for i in x[2]
-            ])
+            ]).flatten()
 
         elif self._wick_parallel == 1:
 
-            flattened = wick_terms.flatMap(
+            flattened = wick_terms.map(
                 lambda x: [(x[0], x[1], i) for i in x[2]]
-            )
+            ).flatten()
             if self._num_partitions is not None:
                 flattened = flattened.repartition(self._num_partitions)
 
@@ -146,25 +148,24 @@ class WickDrudge(Drudge, abc.ABC):
 
             # This level of parallelism is reserved for really hard problems.
             expanded = []
-            for term, contrs, schemes in wick_terms.collect():
-                # To work around a probable Spark bug.  Problem occurs when we
-                # have closures inside a loop to be distributed out.
+            for term, contrs, schemes in wick_terms.compute():
+                # To work around computational issues.  
                 form_term = functools.partial(
                     _form_term_from_wick_bcast, term, contrs, phase, resolvers
                 )
 
-                curr = self._ctx.parallelize(schemes).map(form_term)
+                curr = db.from_sequence(schemes, npartitions=self._num_partitions or 1).map(form_term)
                 expanded.append(curr)
                 continue
 
-            normal_ordered = self._ctx.union(expanded)
+            normal_ordered = db.concat(expanded)
 
         else:
             raise ValueError(
                 'Invalid Wick expansion parallel level', self._wick_parallel
             )
 
-        return terms_to_keep.union(normal_ordered)
+        return db.concat([terms_to_keep, normal_ordered])
 
 
 #

@@ -13,7 +13,8 @@ import warnings
 from collections.abc import Iterable, Sequence
 
 from IPython.display import Math, display
-from pyspark import RDD, SparkContext
+import dask.bag as db
+from dask.bag import Bag
 from sympy import (
     IndexedBase, Symbol, Indexed, Wild, symbols, sympify, Expr, Add, Matrix, Mul
 )
@@ -60,7 +61,7 @@ class Tensor:
     # Term creation
     #
 
-    def __init__(self, drudge: 'Drudge', terms: RDD,
+    def __init__(self, drudge: 'Drudge', terms: Bag,
                  free_vars: typing.Set[Symbol] = None,
                  expanded=False, repartitioned=False):
         """Initialize the tensor.
@@ -101,7 +102,7 @@ class Tensor:
 
     @property
     def terms(self):
-        """The terms in the tensor, as an RDD object.
+        """The terms in the tensor, as a Dask Bag object.
 
         Although for users, normally there is no need for direct manipulation of
         the terms, it is still exposed here for flexibility.
@@ -121,7 +122,7 @@ class Tensor:
 
         """
         if self._local_terms is None:
-            self._local_terms = self._terms.collect()
+            self._local_terms = self._terms.compute()
         else:
             pass
 
@@ -138,7 +139,7 @@ class Tensor:
             return len(self._local_terms)
         else:
             self.cache()  # We never get a tensor just to count its terms.
-            return self._terms.count()
+            return self._terms.count().compute()
 
     def cache(self):
         """Cache the terms in the tensor.
@@ -148,14 +149,14 @@ class Tensor:
         for the ease of chaining.
         """
 
-        self._terms.cache()
+        self._terms = self._terms.persist()
         return self
 
     def repartition(self, num_partitions=None, cache=False):
         """Repartition the terms across the Spark cluster.
 
         This function should be called when the terms need to be rebalanced
-        among the workers.  Note that this incurs an Spark RDD shuffle operation
+        among the workers.  Note that this incurs a Dask repartition operation
         and might be very expensive.  Its invocation and the number of
         partitions used need to be fine-tuned for different problems to achieve
         good performance.
@@ -200,7 +201,7 @@ class Tensor:
 
         # Work around a pyspark bug by doing the reduction locally.
         return all(
-            self._terms.map(lambda x: x.is_scalar).collect()
+            self._terms.map(lambda x: x.is_scalar).compute()
         )
 
     @property
@@ -217,11 +218,16 @@ class Tensor:
         """Get the free variables in the given terms."""
 
         # The terms are definitely going to be used for other purposes.
-        terms.cache()
+        terms = terms.persist()
 
-        return terms.map(
+        free_vars_list = terms.map(
             lambda term: term.free_vars
-        ).aggregate(set(), _union, _union)
+        ).compute()
+        
+        result = set()
+        for vars_set in free_vars_list:
+            result.update(vars_set)
+        return result
         # TODO: investigate performance characteristic with treeAggregate.
 
     @property
@@ -253,7 +259,7 @@ class Tensor:
         # Work around a possible pyspark bug in reduce.
         return any(
             self._terms.map(functools.partial(Term.has_base, base=base))
-                .collect()
+                .compute()
         )
 
     #
@@ -350,7 +356,7 @@ class Tensor:
         assert isinstance(drudge, Drudge)
 
         # Subclasses might be of __init__ function of a different signature.
-        Tensor.__init__(self, drudge, drudge.ctx.parallelize(state))
+        Tensor.__init__(self, drudge, db.from_sequence(state, npartitions=drudge.num_partitions or 1))
         return
 
     #
@@ -358,7 +364,7 @@ class Tensor:
     #
 
     def apply(self, func, **kwargs):
-        """Apply the given function to the RDD of terms.
+        """Apply the given function to the Bag of terms.
 
         This function is analogous to the replace function of Python named
         tuples, the same value from self for the tensor initializer is going to
@@ -392,7 +398,7 @@ class Tensor:
     #
     # Here for a lot of methods, we have two versions, with one being public,
     # another being private with a leading underscore.  The private version
-    # operates on given RDD of terms and returns another RDD of terms.  The
+    # operates on given Bag of terms and returns another Bag of terms.  The
     # public version operates on the terms of the current tensor, and return
     # another tensor.
     #
@@ -422,7 +428,7 @@ class Tensor:
 
         return self.apply(functools.partial(self._reset_dumms, excl=excl))
 
-    def _reset_dumms(self, terms: RDD, excl) -> RDD:
+    def _reset_dumms(self, terms: Bag, excl) -> Bag:
         """Get terms with dummies reset.
 
         Note that this function does not automatically add the free variables in
@@ -541,7 +547,7 @@ class Tensor:
         ))
 
     def _simplify_sums(
-            self, terms: RDD, simplifiers=True, excl_bases=True
+            self, terms: Bag, simplifiers=True, excl_bases=True
     ):
         """Simplify the summations in the given terms."""
 
@@ -574,7 +580,7 @@ class Tensor:
     @staticmethod
     def _expand(terms):
         """Get terms after they are fully expanded."""
-        return terms.flatMap(lambda term: term.expand())
+        return terms.map(lambda term: term.expand()).flatten()
 
     def shallow_expand(self):
         """Expand terms with addition amplitudes into multiple terms.
@@ -605,9 +611,9 @@ class Tensor:
         return self.apply(self._sort)
 
     @staticmethod
-    def _sort(terms: RDD):
+    def _sort(terms: Bag):
         """Sort the terms in the tensor."""
-        return terms.sortBy(lambda term: term.sort_key)
+        return terms.map_partitions(lambda x: sorted(x, key=lambda term: term.sort_key))
 
     def merge(self, consts=None, gens=None):
         """Merge some terms.
@@ -644,9 +650,16 @@ class Tensor:
         else:
             specials = _DecomposeSpecials(consts, gens)
 
-        return terms.map(
+        decomposed = terms.map(
             functools.partial(_decompose_term, specials=specials)
-        ).reduceByKey(operator.add).map(_recover_term)
+        )
+        # Group by key and sum coefficients
+        grouped = decomposed.groupby(lambda pair: pair[0])
+        merged = grouped.map(lambda group: (
+            group[0],  # key
+            sum(pair[1] for pair in group[1])  # sum coefficients
+        ))
+        return merged.map(_recover_term)
 
     #
     # Canonicalization
@@ -819,7 +832,7 @@ class Tensor:
             free_vars = None
 
         return Tensor(
-            self._drudge, self._terms.union(other.terms),
+            self._drudge, db.concat([self._terms, other.terms]),
             free_vars=free_vars,
             expanded=self._expanded and other.expanded
         )
@@ -893,9 +906,9 @@ class Tensor:
         prod, free_vars, expanded = self._cartesian_terms(other, right)
 
         dumms = self._drudge.dumms
-        return Tensor(self._drudge, prod.flatMap(
+        return Tensor(self._drudge, prod.map(
             lambda x: x[0].comm_term(x[1], dumms=dumms.value, excl=free_vars)
-        ), free_vars=free_vars, expanded=expanded)
+        ).flatten(), free_vars=free_vars, expanded=expanded)
 
     def _cartesian_terms(self, other, right):
         """Cartesian the terms with the terms in another tensor.
@@ -908,9 +921,9 @@ class Tensor:
         if isinstance(other, Tensor):
 
             if right:
-                prod = other.terms.cartesian(self._terms)
+                prod = other.terms.product(self._terms)
             else:
-                prod = self._terms.cartesian(other.terms)
+                prod = self._terms.product(other.terms)
 
             free_vars = self.free_vars | other.free_vars
             expanded = self._expanded and other._expanded
@@ -920,10 +933,10 @@ class Tensor:
 
             other_terms = parse_terms(other)
             if len(other_terms) > 1:
-                prod = self._terms.flatMap(lambda term: [
+                prod = self._terms.map(lambda term: [
                     (i, term) if right else (term, i)
                     for i in other_terms
-                ])
+                ]).flatten()
             else:
                 # Special optimization when we just have one term.
                 other_term = other_terms[0]
@@ -1381,9 +1394,9 @@ class Tensor:
 
         rewritten = self._terms.map(
             lambda term: rewrite_term(term, vecs, new_amp)
-        ).cache()
+        ).persist()
         new_terms = [
-            i for i in rewritten.countByKey().keys() if i is not None
+            i for i in rewritten.pluck(0).distinct().compute() if i is not None
         ]
 
         get_term = operator.itemgetter(1)
@@ -1393,15 +1406,16 @@ class Tensor:
         new_defs = {}
         for i in new_terms:
             def_terms = rewritten.filter(lambda x: x[0] == i).map(get_term)
-            # Eagerly evaluate to circumvent a Spark bug.
-            def_terms.cache()
-            def_terms.count()
+            # Eagerly evaluate to circumvent computational issues.
+            def_terms = def_terms.persist()
+            def_terms.count().compute()
             new_defs[i.amp] = Tensor(self._drudge, def_terms)
             continue
 
-        return Tensor(self._drudge, untouched_terms.union(
-            self._drudge.ctx.parallelize(new_terms)
-        )), new_defs
+        return Tensor(self._drudge, db.concat([
+            untouched_terms,
+            db.from_sequence(new_terms, npartitions=self._drudge.num_partitions or 1)
+        ])), new_defs
 
     def expand_sums(
             self, range_: Range, expander: Sum_expander,
@@ -1590,7 +1604,7 @@ class Tensor:
         :py:meth:`filter` and :py:meth:`map` can be understood as special
         case of this method.
         """
-        return Tensor(self._drudge, self._terms.flatMap(func))
+        return Tensor(self._drudge, self._terms.map(func).flatten())
 
     def map2scalars(self, action, skip_vecs=False, skip_ranges=True):
         """Map the given action to the scalars in the tensor.
@@ -1974,27 +1988,26 @@ class Drudge:
 
     # We do not need slots here.  There is generally only one drudge instance.
 
-    def __init__(self, ctx: SparkContext, num_partitions=True):
+    def __init__(self, ctx=None, num_partitions=True):
         """Initialize the drudge.
 
         Parameters
         ----------
 
         ctx
-            The Spark context to be used.
+            Context parameter (kept for backward compatibility, not used in Dask).
 
         num_partitions
-            The preferred number of partitions.  By default, it is the default
-            parallelism of the given Spark environment.  Or an explicit integral
-            value can be given.  It can be set to None, which disable all
-            explicit load-balancing by shuffling.
+            The preferred number of partitions.  By default, it is 4.
+            Or an explicit integral value can be given.  It can be set to None, 
+            which disable all explicit load-balancing by shuffling.
 
         """
 
         self._ctx = ctx
 
         if num_partitions is True:
-            self._num_partitions = self._ctx.defaultParallelism
+            self._num_partitions = 4  # Default partitions for Dask
         elif isinstance(num_partitions, int) or num_partitions is None:
             self._num_partitions = num_partitions
         else:
@@ -2027,7 +2040,7 @@ class Drudge:
 
     @property
     def ctx(self):
-        """The Spark context of the drudge.
+        """The context of the drudge (kept for backward compatibility).
         """
         return self._ctx
 
@@ -2467,13 +2480,13 @@ class Drudge:
     def normal_order(self, terms, **kwargs):
         """Normal order the terms in the given tensor.
 
-        This method should be called with the RDD of some terms, and another RDD
+        This method should be called with the Bag of some terms, and another Bag
         of terms, where all the vector parts are normal ordered according to
         domain-specific rules, should be returned.
 
         By default, we work for the free algebra.  So nothing is done by this
         function.  For noncommutative algebraic system, this function needs to
-        be overridden to return an RDD for the normal-ordered terms from the
+        be overridden to return a Bag for the normal-ordered terms from the
         given terms.
         """
 
@@ -2591,9 +2604,9 @@ class Drudge:
         sum_args = args[:-1]
 
         if isinstance(summand, Tensor):
-            return Tensor(self, summand.terms.flatMap(
+            return Tensor(self, summand.terms.map(
                 lambda x: sum_term(sum_args, x, predicate=predicate)
-            ))
+            ).flatten())
         else:
             return self.create_tensor(sum_term(
                 sum_args, summand, predicate=predicate
@@ -2659,9 +2672,9 @@ class Drudge:
 
             einst_res = summand.expand().terms.map(
                 lambda x: einst_term(x, resolvers.value)
-            ).cache()
+            ).persist()
             tensor = Tensor(
-                self, einst_res.flatMap(operator.itemgetter(0)), expanded=True
+                self, einst_res.map(operator.itemgetter(0)).flatten(), expanded=True
             )
 
             if not auto_exts:
@@ -2669,21 +2682,14 @@ class Drudge:
                 exts_inters = None
             else:
 
-                def seq_op(curr, new):
-                    """Merge current externals with a new Einstein result."""
-                    curr[0].update(new[1])
-                    curr[1] = _inters(curr[1], new[1])
-                    return curr
-
-                def comb_op(curr, new):
-                    """Merge externals from different partitions."""
-                    curr[0].update(new[0])
-                    curr[1] = _inters(curr[1], new[1])
-                    return curr
-
-                exts_union, exts_inters = einst_res.aggregate(
-                    [set(), None], seq_op, comb_op
-                )
+                # Process all einst results and manually aggregate
+                all_results = einst_res.compute()
+                exts_union = set()
+                exts_inters = None
+                
+                for terms_list, external_vars in all_results:
+                    exts_union.update(external_vars)
+                    exts_inters = _inters(exts_inters, external_vars)
 
         else:
             res_terms = []
@@ -2721,7 +2727,7 @@ class Drudge:
         The terms should be given as an iterable of Term objects.  This function
         should not be necessary in user code.
         """
-        return Tensor(self, self._ctx.parallelize(terms))
+        return Tensor(self, db.from_sequence(terms, npartitions=self.num_partitions or 1))
 
     #
     # Tensor definition creation.

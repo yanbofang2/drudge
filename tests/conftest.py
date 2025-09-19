@@ -8,18 +8,22 @@ IF_DUMMY_SPARK = 'DUMMY_SPARK' in os.environ
 
 @pytest.fixture(scope='session', autouse=True)
 def spark_ctx():
-    """A simple spark context."""
-
+    """A simple context fixture for backward compatibility.
+    
+    After migration to Dask, this fixture returns None since 
+    Drudge no longer requires a context parameter.
+    """
+    
+    # For backward compatibility with tests that still expect a context,
+    # we return a dummy context object for tests that still use dummy_spark
     if IF_DUMMY_SPARK:
         from dummy_spark import SparkConf, SparkContext
         conf = SparkConf()
         ctx = SparkContext(master='', conf=conf)
+        return ctx
     else:
-        from pyspark import SparkConf, SparkContext
-        conf = SparkConf().setMaster('local[2]').setAppName('drudge-unittest')
-        ctx = SparkContext(conf=conf)
-
-    return ctx
+        # For Dask-based drudge, no context is needed
+        return None
 
 
 def skip_in_spark(**kwargs):

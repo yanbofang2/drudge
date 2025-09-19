@@ -102,7 +102,9 @@ def test_drs_symb_call(spark_ctx):
     v = Vec('v')
     tensor_meth = 'local_terms'
     assert not hasattr(v, tensor_meth)  # Or the test just will not work.
-    assert DrsSymbol(Drudge(spark_ctx), tensor_meth)(v) == [
+    # Create Drudge without context (Dask-based)
+    drudge_instance = Drudge() if spark_ctx is None else Drudge(spark_ctx)
+    assert DrsSymbol(drudge_instance, tensor_meth)(v) == [
         Term(sums=(), amp=Integer(1), vecs=(v,))
     ]
 
@@ -110,7 +112,8 @@ def test_drs_symb_call(spark_ctx):
 def test_drs_tensor_def_dispatch(spark_ctx):
     """Tests the dispatch to drudge for tensor definitions."""
 
-    dr = Drudge(spark_ctx)
+    # Create Drudge without context (Dask-based)
+    dr = Drudge() if spark_ctx is None else Drudge(spark_ctx)
     names = dr.names
 
     i_symb = Symbol('i')
@@ -190,10 +193,10 @@ def test_drs_env():
 
 
 CONF_SCRIPT = """
-from dummy_spark import SparkContext
+# Import Drudge without SparkContext for Dask-based implementation
 from drudge import Drudge
 
-{} = Drudge(SparkContext())
+{} = Drudge()
 """.format(_DRUDGE_MAGIC)
 
 DRUDGE_SCRIPT = """
